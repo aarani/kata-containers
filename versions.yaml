@@ -338,6 +338,11 @@ externals:
       as: "ghcr.io/confidential-containers/staged-images/coco-as-grpc"
       rvps: "ghcr.io/confidential-containers/staged-images/rvps"
 
+  docker:
+    description: "Docker static binaries, for test hosts without podman-docker"
+    url: "https://download.docker.com/linux/static/stable"
+    version: "29.9.2"
+
   containerd:
     description: |
       Containerd for Kubernetes Container Runtime Interface.

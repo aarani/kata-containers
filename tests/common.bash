@@ -1475,6 +1475,47 @@ function install_docker() {
 	sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 }
 
+# Install the docker CLI and daemon from Docker's static binaries, for hosts
+# whose distribution offers neither podman-docker nor a docker package that
+# leaves containerd alone. Only docker, dockerd, docker-init and docker-proxy
+# are installed: containerd, ctr, runc and the runc shim stay the versions the
+# tests install themselves. dockerd uses the system containerd when its socket
+# exists, under its own "moby" namespace, and starts a private one otherwise.
+function install_docker_static() {
+	local -r version="${1}"
+	local url tarball_name tmp_dir binary
+
+	url="$(get_from_kata_deps ".externals.docker.url")"
+	tarball_name="docker-${version}.tgz"
+	tmp_dir="$(mktemp -d)"
+
+	curl -fsSL --retry 5 -o "${tmp_dir}/${tarball_name}" \
+		"${url}/$(uname -m)/${tarball_name}"
+	tar -xzf "${tmp_dir}/${tarball_name}" -C "${tmp_dir}"
+	for binary in docker dockerd docker-init docker-proxy; do
+		sudo install -m 0755 "${tmp_dir}/docker/${binary}" "/usr/local/bin/${binary}"
+	done
+	rm -rf "${tmp_dir}"
+
+	sudo mkdir -p /etc/systemd/system
+	sudo tee /etc/systemd/system/docker.service > /dev/null << EOF
+[Unit]
+Description=Docker Application Container Engine (static binaries)
+After=network-online.target containerd.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/dockerd
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+	sudo systemctl daemon-reload
+	sudo systemctl enable --now docker
+}
+
 # Convert architecture to the name used by golang
 function arch_to_golang() {
 	local -r arch="$(uname -m)"

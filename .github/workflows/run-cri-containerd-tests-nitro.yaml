@@ -1,0 +1,215 @@
+name: CI | Run cri-containerd tests on AWS Nitro
+
+# DO NOT MERGE: proof of concept for the Firecracker Nitro Sandboxes work.
+#
+# A copy of run-cri-containerd-tests.yaml that runs on an on-demand EC2
+# instance instead of a GitHub-hosted runner, because Nitro Sandboxes need a
+# parent instance launched with Nitro Enclaves enabled. The instance is
+# started with a fork of machulav/ec2-github-runner that adds an
+# `enclave-options` input, as a Spot instance, registered as a single-use JIT
+# runner, and terminated at the end whatever the outcome. A Spot interruption
+# fails the test job; the stop job still runs.
+#
+# Who can make this workflow start an instance:
+#   - Only runs triggered by the repository owner (github.triggering_actor):
+#     a workflow_dispatch, a re-run, or the owner adding ok-to-test to a pull
+#     request. A pull request author pushing new commits triggers nothing.
+#   - The start job runs in the `nitro-ci` environment. Give it a required
+#     reviewer so every launch waits for an approval, and keep the AWS and
+#     runner secrets there as environment secrets, not repository secrets.
+#   - The stop job runs in `nitro-ci-cleanup`, with the same secrets and no
+#     reviewer, so terminating an instance never waits for anybody.
+#   - Each environment can hold its own access key, so the cleanup key can
+#     belong to an IAM user that may only terminate and describe instances.
+#
+# Environment secrets (in both environments):
+#   NITRO_AWS_ACCESS_KEY_ID      Access key of the IAM user that manages the
+#   NITRO_AWS_SECRET_ACCESS_KEY  runners. In nitro-ci it needs
+#                                ec2:RunInstances, ec2:CreateTags,
+#                                ec2:DescribeInstances and ec2:GetConsoleOutput;
+#                                in nitro-ci-cleanup, ec2:TerminateInstances and
+#                                ec2:DescribeInstances.
+#   NITRO_RUNNER_GH_TOKEN        Token able to create self-hosted runners for
+#                                this repository (generate-jitconfig).
+#
+# Repository variables:
+#   vars.NITRO_AWS_REGION            Region to launch in.
+#   vars.NITRO_EC2_IMAGE_ID          AMI of the parent instance.
+#   vars.NITRO_EC2_INSTANCE_TYPE     An instance type that supports Nitro Enclaves.
+#   vars.NITRO_EC2_SUBNET_ID         Subnet for the instance.
+#   vars.NITRO_EC2_SECURITY_GROUP_ID Security group allowing outbound traffic.
+
+on:
+  workflow_call:
+    inputs:
+      tarball-suffix:
+        required: false
+        type: string
+      commit-hash:
+        required: false
+        type: string
+      target-branch:
+        required: false
+        type: string
+        default: ""
+      arch:
+        description: The arch of the tarball.
+        required: false
+        type: string
+        default: amd64
+      containerd_version:
+        description: The version of containerd for testing.
+        required: false
+        type: string
+        default: latest
+      vmm:
+        description: The kata hypervisor for testing.
+        required: false
+        type: string
+        default: fc-nitro-runtime-rs
+    secrets:
+      # Normally unset: the jobs read them from their environment instead.
+      NITRO_AWS_ACCESS_KEY_ID:
+        required: false
+      NITRO_AWS_SECRET_ACCESS_KEY:
+        required: false
+      NITRO_RUNNER_GH_TOKEN:
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-cri-tests-nitro-${{ toJSON(inputs) }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  start-nitro-runner:
+    name: start-nitro-runner-${{ inputs.arch }}
+    # Only the repository owner may spend the AWS account; see the top of the file.
+    if: ${{ github.triggering_actor == github.repository_owner }}
+    environment: nitro-ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      label: ${{ steps.start.outputs.label }}
+      ec2-instance-id: ${{ steps.start.outputs.ec2-instance-id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.NITRO_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.NITRO_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.NITRO_AWS_REGION }}
+
+      - name: Start an enclave-enabled EC2 runner
+        id: start
+        # Fork of machulav/ec2-github-runner v2.6.1 with an `enclave-options` input.
+        uses: aarani/ec2-github-runner@51b638591f0ab2ca3456e0ae8ce866368fc70ad7 # enclave-options
+        with:
+          mode: start
+          github-token: ${{ secrets.NITRO_RUNNER_GH_TOKEN }}
+          ec2-image-id: ${{ vars.NITRO_EC2_IMAGE_ID }}
+          ec2-instance-type: ${{ vars.NITRO_EC2_INSTANCE_TYPE }}
+          subnet-id: ${{ vars.NITRO_EC2_SUBNET_ID }}
+          security-group-id: ${{ vars.NITRO_EC2_SECURITY_GROUP_ID }}
+          enclave-options: 'true'
+          market-type: spot
+          use-jit: 'true'
+          # Amazon Linux 2023 ships without git, which checkout and
+          # git-helper.sh need before install-dependencies runs.
+          packages: '["git"]'
+          metadata-options: '{"HttpTokens": "required", "HttpEndpoint": "enabled"}'
+          aws-resource-tags: >-
+            [
+              {"Key": "Name", "Value": "kata-nitro-ci"},
+              {"Key": "GitHubRepository", "Value": "${{ github.repository }}"},
+              {"Key": "GitHubRunId", "Value": "${{ github.run_id }}"}
+            ]
+
+  run-cri-containerd:
+    name: run-cri-containerd-nitro-${{ inputs.arch }} (${{ inputs.containerd_version }}, ${{ inputs.vmm }})
+    needs: start-nitro-runner
+    runs-on: ${{ needs.start-nitro-runner.outputs.label }}
+    timeout-minutes: 25
+    env:
+      CONTAINERD_VERSION: ${{ inputs.containerd_version }}
+      GOPATH: ${{ github.workspace }}
+      KATA_HYPERVISOR: ${{ inputs.vmm }}
+    steps:
+      - name: Check that the parent instance can run Nitro Sandboxes
+        run: |
+          test -c /dev/nitro_enclaves
+          cat /sys/class/misc/nitro_enclaves/cpu_pool/* /sys/class/misc/nitro_enclaves/mem_pool/* || true
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit-hash }}
+          allow-unsafe-pr-checkout: true
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Rebase atop of the latest target branch
+        run: |
+          ./tests/git-helper.sh "rebase-atop-of-the-latest-target-branch"
+        env:
+          TARGET_BRANCH: ${{ inputs.target-branch }}
+
+      - name: Install yq
+        run: |
+          ./ci/install_yq.sh
+        env:
+          INSTALL_IN_GOPATH: false
+
+      - name: Read properties from versions.yaml
+        run: |
+          go_version="$(yq '.languages.golang.version' versions.yaml)"
+          [ -n "$go_version" ]
+          echo "GO_VERSION=${go_version}" >> "$GITHUB_ENV"
+
+      - name: Setup Golang version ${{ env.GO_VERSION }}
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: bash tests/integration/cri-containerd/gha-run.sh install-dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: get-kata-tarball for ${{ inputs.arch }}
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: kata-static-tarball-${{ inputs.arch }}${{ inputs.tarball-suffix }}
+          path: kata-artifacts
+
+      - name: Install kata
+        run: bash tests/integration/cri-containerd/gha-run.sh install-kata kata-artifacts
+
+      - name: Run cri-containerd tests for ${{ inputs.arch }}
+        timeout-minutes: 10
+        run: bash tests/integration/cri-containerd/gha-run.sh run
+
+  stop-nitro-runner:
+    name: stop-nitro-runner-${{ inputs.arch }}
+    needs: [start-nitro-runner, run-cri-containerd]
+    # Always terminate the instance, also when the tests fail or are cancelled.
+    if: ${{ always() && needs.start-nitro-runner.outputs.ec2-instance-id != '' }}
+    environment: nitro-ci-cleanup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.NITRO_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.NITRO_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.NITRO_AWS_REGION }}
+
+      - name: Stop the EC2 runner
+        uses: aarani/ec2-github-runner@51b638591f0ab2ca3456e0ae8ce866368fc70ad7 # enclave-options
+        with:
+          mode: stop
+          github-token: ${{ secrets.NITRO_RUNNER_GH_TOKEN }}
+          label: ${{ needs.start-nitro-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-nitro-runner.outputs.ec2-instance-id }}

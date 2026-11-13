@@ -562,6 +562,21 @@ jobs:
       containerd_version: ${{ matrix.params.containerd_version }}
       vmm: ${{ matrix.params.vmm }}
 
+  # DO NOT MERGE: runs only where the Nitro EC2 runner is configured, and only
+  # when the repository owner triggered the run.
+  run-cri-containerd-tests-nitro-amd64:
+    if: ${{ inputs.skip-test != 'yes' && vars.NITRO_EC2_IMAGE_ID != '' &&
+            github.triggering_actor == github.repository_owner }}
+    needs: build-kata-static-tarball-amd64
+    uses: ./.github/workflows/run-cri-containerd-tests-nitro.yaml
+    with:
+      tarball-suffix: -${{ inputs.tag }}
+      commit-hash: ${{ inputs.commit-hash }}
+      target-branch: ${{ inputs.target-branch }}
+      arch: amd64
+      containerd_version: latest
+      vmm: fc-nitro-runtime-rs
+
   run-cri-containerd-tests-s390x:
     if: ${{ inputs.skip-test != 'yes' }}
     needs: build-kata-static-tarball-s390x
